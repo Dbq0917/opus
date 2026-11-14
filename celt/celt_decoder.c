@@ -71,6 +71,13 @@
 #define FRAME_PLC_NEURAL   4
 #define FRAME_DRED         5
 
+/* Per-frame fade for 2.5, 5, 10, and 20 ms, so the decay rate does not
+   depend on the frame size. */
+static const opus_val16 plc_fade_q15[4] = {
+   QCONST16(.9725f, 15), QCONST16(.9457f, 15),
+   QCONST16(.8944f, 15), QCONST16(.8f, 15)
+};
+
 /**********************************************************************/
 /*                                                                    */
 /*                             DECODER                                */
@@ -106,7 +113,9 @@ struct OpusCustomDecoder {
    opus_uint32 rng;
    int error;
    int last_pitch_index;
+   int plc_pitch_index;
    opus_val16 plc_decay[2];
+   celt_glog plc_energy_decay;
    int loss_duration;
    int plc_duration;
    int last_frame_type;
@@ -765,6 +774,7 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
    {
       /* Noise-based PLC/CNG */
       VARDECL(celt_norm, X);
+      VARDECL(celt_glog, plcBandE);
       opus_uint32 seed;
       int end;
       int effEnd;
@@ -773,6 +783,11 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
       effEnd = IMAX(start, IMIN(end, mode->effEBands));
 
       ALLOC(X, C*N, celt_norm);   /**< Interleaved normalised MDCTs */
+      /* Keep PLC energy separate from oldBandE. Normal frames use oldBandE as
+         the energy predictor, so decaying it here would bias the frames that
+         follow the loss. */
+      ALLOC(plcBandE, 2*nbEBands, celt_glog);   /**< Energy used only for concealment */
+      OPUS_COPY(plcBandE, oldBandE, 2*nbEBands);
       c=0; do {
          OPUS_MOVE(decode_mem[c], decode_mem[c]+N,
                decode_buffer_size-N+overlap);
@@ -785,11 +800,15 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
       /* Energy decay */
       decay = (1<<LM)*GCONST(.0625f);
       if (st->last_frame_type != FRAME_PLC_NOISE)
-         decay += MAXG(GCONST(1.f), IMIN(160, loss_duration)*GCONST(.0625f));
+         st->plc_energy_decay = decay
+               + MAXG(GCONST(1.f), IMIN(160, loss_duration)*GCONST(.0625f));
+      else
+         st->plc_energy_decay += decay;
       c=0; do
       {
          for (i=start;i<end;i++)
-            oldBandE[c*nbEBands+i] = MAXG(backgroundLogE[c*nbEBands+i], oldBandE[c*nbEBands+i] - decay);
+            plcBandE[c*nbEBands+i] = MAXG(backgroundLogE[c*nbEBands+i],
+                  oldBandE[c*nbEBands+i] - st->plc_energy_decay);
       } while (++c<C);
       seed = st->rng;
       for (c=0;c<C;c++)
@@ -811,7 +830,7 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
       }
       st->rng = seed;
 
-      celt_synthesis(mode, X, out_syn, oldBandE, start, effEnd, C, C, 0, LM, st->downsample, 0, st->arch ARG_QEXT(NULL) ARG_QEXT(NULL) ARG_QEXT(0));
+      celt_synthesis(mode, X, out_syn, plcBandE, start, effEnd, C, C, 0, LM, st->downsample, 0, st->arch ARG_QEXT(NULL) ARG_QEXT(NULL) ARG_QEXT(0));
 
       /* Run the postfilter with the last parameters. */
       c=0; do {
@@ -855,7 +874,7 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
       } else {
          pitch_index = st->last_pitch_index;
          if (st->plc_duration*mode->shortMdctSize >= pitch_index)
-            fade = QCONST16(.8f,15);
+            fade = plc_fade_q15[IMIN(3, LM)];
       }
 #ifdef ENABLE_DEEP_PLC
       if (curr_neural && !last_neural) update_plc_state(lpcnet, decode_mem, &st->plc_preemphasis_mem, C);
@@ -988,7 +1007,11 @@ static void celt_decode_lost(CELTDecoder * OPUS_RESTRICT st, int N, int LM
                      || E0 < MULT16_32_Q15(QCONST16(.25f, 15), Ek))
                   break;
             }
-            pitch_index *= k-1;
+            /* Keep the same multiple of the pitch period for the whole loss
+               burst. Re-selecting it every frame moves the copy window. */
+            if (c==0 || st->plc_pitch_index <= 0)
+               st->plc_pitch_index = pitch_index*(k-1);
+            pitch_index = st->plc_pitch_index;
          }
 
          /* Save the folded right-overlap tail from the previous MDCT frame before
@@ -1705,6 +1728,7 @@ int celt_decode_with_ec_dred(CELTDecoder * OPUS_RESTRICT st, const unsigned char
    deemphasis(out_syn, pcm, N, CC, st->downsample, mode->preemph, st->preemph_memD, accum, st->arch);
    st->loss_duration = 0;
    st->plc_duration = 0;
+   st->plc_energy_decay = 0;
    st->last_frame_type = FRAME_NORMAL;
    st->prefilter_and_fold = 0;
    RESTORE_STACK;

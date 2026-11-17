@@ -350,7 +350,11 @@ static OPUS_INLINE float celt_exp2(float x)
 #define celt_exp2_db celt_exp2
 #define celt_log2_db celt_log2
 
+/* celt_cos_norm2(u) computes cos((PI/2)*u), so
+ * sin(x) = cos((PI/2)*((2/PI)*x - 1)).
+ * Keep the pre-fix expression available for A/B runs and regression reports. */
 #define celt_sin(x) celt_cos_norm2((2.f/PI) * (x) - 1.0f)
+#define celt_sin_legacy(x) celt_cos_norm2((0.5f*PI) * (x) - 1.0f)
 #define celt_log(x) (celt_log2(x) * 0.6931471805599453f)
 #define celt_exp(x) (celt_exp2((x) * 1.4426950408889634f))
 

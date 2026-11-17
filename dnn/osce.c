@@ -38,6 +38,14 @@
 #include "float_cast.h"
 #include "arch.h"
 #include "mathops.h"
+
+/* Build-time canary for the celt_sin() rollout.  The default uses the
+ * corrected implementation; setting this to 1 builds the old behaviour for
+ * side-by-side encoder runs.  This is intentionally not a public API. */
+#ifndef OSCE_USE_LEGACY_CELT_SIN
+#define OSCE_USE_LEGACY_CELT_SIN 0
+#endif
+
 /*#define OSCE_DEBUG*/
 #ifdef OSCE_DEBUG
 #include <stdio.h>
@@ -986,7 +994,11 @@ static void apply_valin_activation(float *x, int len)
     }
     for (i = 0; i < len; i++)
     {
+#if OSCE_USE_LEGACY_CELT_SIN
+        x[i] *= celt_sin_legacy(y[i]);
+#else
         x[i] *= celt_sin(y[i]);
+#endif
     }
 }
 

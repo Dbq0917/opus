@@ -37,6 +37,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 #include "bands.h"
 #include "cpu_support.h"
@@ -245,6 +246,266 @@ void test_cos(void)
    }
    fprintf (stdout, "celt_cos_norm2 max_error: %15.25e\n", max_error);
 }
+
+#ifndef FIXED_POINT
+
+#define SIN_SWEEP_START (-14.0f)
+#define SIN_SWEEP_STEP  (1.0f/1024.0f)
+#define SIN_SWEEP_POINTS 28672
+#define SIN_HIST_BINS 8
+
+static int compare_float(const void *a, const void *b)
+{
+   float fa = *(const float *)a;
+   float fb = *(const float *)b;
+   return (fa > fb) - (fa < fb);
+}
+
+static float sin_percentile(const float *sorted, int n, double p)
+{
+   int idx = (int)(p * (n - 1) + 0.5);
+   if (idx < 0)
+      idx = 0;
+   if (idx >= n)
+      idx = n - 1;
+   return sorted[idx];
+}
+
+void test_sin(void)
+{
+   static float err_new[SIN_SWEEP_POINTS];
+   static float err_legacy[SIN_SWEEP_POINTS];
+   static const float hist_edges[SIN_HIST_BINS] =
+      {1.0e-7f, 2.0e-7f, 5.0e-7f, 1.0e-6f,
+       1.0e-5f, 1.0e-4f, 1.0e-3f, 1.0e-2f};
+   int hist_new[SIN_HIST_BINS + 1] = {0};
+   int hist_legacy[SIN_HIST_BINS + 1] = {0};
+   const float error_threshold = 1.0e-6f;
+   float max_new = 0;
+   float max_legacy = 0;
+   double sum_sq_new = 0;
+   double sum_sq_legacy = 0;
+   int i;
+
+   for (i = 0; i < SIN_SWEEP_POINTS; i++)
+   {
+      float x = SIN_SWEEP_START + i * SIN_SWEEP_STEP;
+      float ref = (float)sin((double)x);
+      float error_new = (float)fabs((double)celt_sin(x) - (double)ref);
+      float error_legacy = (float)fabs((double)celt_sin_legacy(x) - (double)ref);
+      int bin;
+
+      err_new[i] = error_new;
+      err_legacy[i] = error_legacy;
+      if (error_new > max_new)
+         max_new = error_new;
+      if (error_legacy > max_legacy)
+         max_legacy = error_legacy;
+      sum_sq_new += (double)error_new * (double)error_new;
+      sum_sq_legacy += (double)error_legacy * (double)error_legacy;
+
+      for (bin = 0; bin < SIN_HIST_BINS; bin++)
+      {
+         if (error_new <= hist_edges[bin])
+            break;
+      }
+      hist_new[bin]++;
+      for (bin = 0; bin < SIN_HIST_BINS; bin++)
+      {
+         if (error_legacy <= hist_edges[bin])
+            break;
+      }
+      hist_legacy[bin]++;
+   }
+
+   if (max_new > error_threshold)
+   {
+      fprintf(stderr,
+              "celt_sin failed: max_error=%15.25e > %15.25e\n",
+              max_new, error_threshold);
+      ret = 1;
+   }
+   /* This keeps the regression test sensitive to the original defect. */
+   if (max_legacy < 1.0f)
+   {
+      fprintf(stderr,
+              "celt_sin_legacy no longer reproduces the defect: max_error=%15.25e\n",
+              max_legacy);
+      ret = 1;
+   }
+
+   qsort(err_new, SIN_SWEEP_POINTS, sizeof(float), compare_float);
+   qsort(err_legacy, SIN_SWEEP_POINTS, sizeof(float), compare_float);
+
+   fprintf(stdout, "celt_sin max_error: %15.25e (threshold %15.25e)\n",
+           max_new, error_threshold);
+   fprintf(stdout, "celt_sin error rms: %15.25e\n",
+           (float)sqrt(sum_sq_new / SIN_SWEEP_POINTS));
+   fprintf(stdout, "celt_sin error percentiles: p50=%15.8e p90=%15.8e "
+           "p99=%15.8e p99.9=%15.8e\n",
+           sin_percentile(err_new, SIN_SWEEP_POINTS, 0.50),
+           sin_percentile(err_new, SIN_SWEEP_POINTS, 0.90),
+           sin_percentile(err_new, SIN_SWEEP_POINTS, 0.99),
+           sin_percentile(err_new, SIN_SWEEP_POINTS, 0.999));
+   fprintf(stdout, "celt_sin error histogram:");
+   for (i = 0; i < SIN_HIST_BINS; i++)
+      fprintf(stdout, " <=%8.1e:%5d", hist_edges[i], hist_new[i]);
+   fprintf(stdout, " >%8.1e:%5d\n", hist_edges[SIN_HIST_BINS - 1],
+           hist_new[SIN_HIST_BINS]);
+
+   fprintf(stdout, "celt_sin_legacy max_error: %15.25e\n", max_legacy);
+   fprintf(stdout, "celt_sin_legacy error rms: %15.25e\n",
+           (float)sqrt(sum_sq_legacy / SIN_SWEEP_POINTS));
+   fprintf(stdout, "celt_sin_legacy error percentiles: p50=%15.8e p90=%15.8e "
+           "p99=%15.8e p99.9=%15.8e\n",
+           sin_percentile(err_legacy, SIN_SWEEP_POINTS, 0.50),
+           sin_percentile(err_legacy, SIN_SWEEP_POINTS, 0.90),
+           sin_percentile(err_legacy, SIN_SWEEP_POINTS, 0.99),
+           sin_percentile(err_legacy, SIN_SWEEP_POINTS, 0.999));
+   fprintf(stdout, "celt_sin_legacy error histogram:");
+   for (i = 0; i < SIN_HIST_BINS; i++)
+      fprintf(stdout, " <=%8.1e:%5d", hist_edges[i], hist_legacy[i]);
+   fprintf(stdout, " >%8.1e:%5d\n", hist_edges[SIN_HIST_BINS - 1],
+           hist_legacy[SIN_HIST_BINS]);
+}
+
+#define SIN_ENERGY_FRAME_SIZE 480
+#define SIN_ENERGY_RATE 48000.0
+
+static double measure_sin_energy(const float *x, double freq, int len)
+{
+   double real = 0;
+   double imag = 0;
+   int i;
+   for (i = 0; i < len; i++)
+   {
+      double phase = 2.0 * PI * freq * i / SIN_ENERGY_RATE;
+      real += x[i] * cos(phase);
+      imag -= x[i] * sin(phase);
+   }
+   return (real * real + imag * imag) / len;
+}
+
+void test_sin_band_energy(void)
+{
+   static const double freqs[] =
+      {250, 500, 1000, 2000, 3000, 4000, 6000, 8000,
+       10000, 12000, 16000, 20000, 23000};
+   const double error_threshold_db = 1.0e-4;
+   const double min_snr_new_db = 100.0;
+   const double max_snr_legacy_db = 20.0;
+   double max_error_new = 0;
+   double max_error_legacy = 0;
+   double min_snr_new = 1.0e9;
+   double max_snr_legacy = -1.0e9;
+   int num_freqs = sizeof(freqs) / sizeof(freqs[0]);
+   int k;
+
+   fprintf(stdout, "celt_sin band-energy check (fs=48000, N=480):\n");
+   for (k = 0; k < num_freqs; k++)
+   {
+      float x_new[SIN_ENERGY_FRAME_SIZE];
+      float x_ref[SIN_ENERGY_FRAME_SIZE];
+      float x_legacy[SIN_ENERGY_FRAME_SIZE];
+      double energy_new;
+      double energy_ref;
+      double energy_legacy;
+      double error_new_db;
+      double error_legacy_db;
+      double signal_energy = 0;
+      double noise_energy_new = 0;
+      double noise_energy_legacy = 0;
+      double snr_new_db;
+      double snr_legacy_db;
+      int i;
+
+      for (i = 0; i < SIN_ENERGY_FRAME_SIZE; i++)
+      {
+         float x = 0.5f * (float)sin(2.0 * PI * freqs[k] * i / SIN_ENERGY_RATE);
+         x_new[i] = x;
+         x_ref[i] = x;
+         x_legacy[i] = x;
+      }
+      for (i = 0; i < SIN_ENERGY_FRAME_SIZE; i++)
+      {
+         float y_new = celt_log((float)fabs((double)x_new[i]) + 1.0e-6f);
+         float y_ref = (float)log((double)fabs((double)x_ref[i]) + 1.0e-6);
+         x_new[i] *= celt_sin(y_new);
+         x_ref[i] *= (float)sin((double)y_ref);
+         x_legacy[i] *= celt_sin_legacy(y_new);
+      }
+
+      energy_new = measure_sin_energy(x_new, freqs[k], SIN_ENERGY_FRAME_SIZE);
+      energy_ref = measure_sin_energy(x_ref, freqs[k], SIN_ENERGY_FRAME_SIZE);
+      energy_legacy = measure_sin_energy(x_legacy, freqs[k],
+                                         SIN_ENERGY_FRAME_SIZE);
+      error_new_db = 10.0 * log10(energy_new / energy_ref);
+      error_legacy_db = 10.0 * log10(energy_legacy / energy_ref);
+      for (i = 0; i < SIN_ENERGY_FRAME_SIZE; i++)
+      {
+         double ref = x_ref[i];
+         double diff_new = x_new[i] - ref;
+         double diff_legacy = x_legacy[i] - ref;
+         signal_energy += ref * ref;
+         noise_energy_new += diff_new * diff_new;
+         noise_energy_legacy += diff_legacy * diff_legacy;
+      }
+      snr_new_db = 10.0 * log10(signal_energy / noise_energy_new);
+      snr_legacy_db = 10.0 * log10(signal_energy / noise_energy_legacy);
+      if (fabs(error_new_db) > max_error_new)
+         max_error_new = fabs(error_new_db);
+      if (fabs(error_legacy_db) > max_error_legacy)
+         max_error_legacy = fabs(error_legacy_db);
+      if (snr_new_db < min_snr_new)
+         min_snr_new = snr_new_db;
+      if (snr_legacy_db > max_snr_legacy)
+         max_snr_legacy = snr_legacy_db;
+
+      fprintf(stdout, "  f=%6.0f Hz  energy_new=% .3e dB  energy_legacy=% .3f dB"
+              "  snr_new=%6.2f dB  snr_legacy=%6.2f dB\n",
+              freqs[k], error_new_db, error_legacy_db, snr_new_db,
+              snr_legacy_db);
+
+      if (fabs(error_new_db) > error_threshold_db)
+      {
+         fprintf(stderr,
+                 "celt_sin band energy failed at %.0f Hz: %15.7e dB > %15.7e dB\n",
+                 freqs[k], error_new_db, error_threshold_db);
+         ret = 1;
+      }
+      if (snr_new_db < min_snr_new_db)
+      {
+         fprintf(stderr,
+                 "celt_sin distortion failed at %.0f Hz: SNR %6.2f dB < %6.2f dB\n",
+                 freqs[k], snr_new_db, min_snr_new_db);
+         ret = 1;
+      }
+   }
+   if (max_error_legacy < 0.05)
+   {
+      fprintf(stderr,
+              "celt_sin_legacy band-energy defect not reproduced: max_error=%15.7e dB\n",
+              max_error_legacy);
+      ret = 1;
+   }
+   if (max_snr_legacy > max_snr_legacy_db)
+   {
+      fprintf(stderr,
+              "celt_sin_legacy distortion not reproduced: best SNR %6.2f dB > %6.2f dB\n",
+              max_snr_legacy, max_snr_legacy_db);
+      ret = 1;
+   }
+   fprintf(stdout, "celt_sin band-energy max_error: %15.7e dB\n",
+           max_error_new);
+   fprintf(stdout, "celt_sin_legacy band-energy max_error: %15.7e dB\n",
+           max_error_legacy);
+   fprintf(stdout, "celt_sin band distortion: min_snr=%6.2f dB\n",
+           min_snr_new);
+   fprintf(stdout, "celt_sin_legacy band distortion: max_snr=%6.2f dB\n",
+           max_snr_legacy);
+}
+
+#endif /* !FIXED_POINT */
 
 void test_atan2(void) {
    float x, y;
@@ -789,6 +1050,10 @@ int main(void)
    testexp2();
    testexp2log2();
    test_cos();
+#ifndef FIXED_POINT
+   test_sin();
+   test_sin_band_energy();
+#endif
 #ifdef FIXED_POINT
    testilog2();
    testlog2_db();

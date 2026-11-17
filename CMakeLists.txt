@@ -721,6 +721,19 @@ if(BUILD_TESTING AND NOT BUILD_SHARED_LIBS)
            -DCMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}
            -P "${PROJECT_SOURCE_DIR}/cmake/RunTest.cmake")
 
+  add_executable(test_opus_fec_recovery ${test_opus_fec_recovery_sources})
+  target_include_directories(test_opus_fec_recovery
+                             PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  target_link_libraries(test_opus_fec_recovery PRIVATE opus)
+  target_compile_definitions(test_opus_fec_recovery PRIVATE OPUS_BUILD)
+  if(OPUS_FIXED_POINT)
+    target_compile_definitions(test_opus_fec_recovery PRIVATE DISABLE_FLOAT_API)
+  endif()
+  add_test(NAME test_opus_fec_recovery COMMAND ${CMAKE_COMMAND}
+           -DTEST_EXECUTABLE=$<TARGET_FILE:test_opus_fec_recovery>
+           -DCMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}
+           -P "${PROJECT_SOURCE_DIR}/cmake/RunTest.cmake")
+
   add_executable(test_opus_padding ${test_opus_padding_sources})
   target_include_directories(test_opus_padding
                              PRIVATE ${CMAKE_CURRENT_BINARY_DIR})

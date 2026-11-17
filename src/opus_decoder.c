@@ -39,6 +39,7 @@
 #endif
 
 #include <stdarg.h>
+#include <math.h>
 #include "celt.h"
 #include "opus.h"
 #include "entdec.h"
@@ -86,6 +87,30 @@ struct OpusDecoder {
    int          frame_size;
    int          prev_redundancy;
    int          last_packet_duration;
+   /* In-band FEC/PLC recovery smoothing. Only exercised on the loss recovery
+      path, so FEC-disabled / loss-free decoding is untouched.
+
+      After a burst, the first normal frames often use intra-coded band energy
+      and therefore bypass the inter-frame energy safety logic. Their energy can
+      then overshoot the concealed signal by several dB (the audible "pop").
+      We cap how fast the amplitude may grow over the next few normal frames so
+      the envelope returns gradually. The gain is applied in-place to the frame
+      already being returned, so no buffering or latency is added. */
+#define RECOVERY_RAMP_FRAMES 6
+/* Maximum allowed energy growth per normal recovery frame. 1.5 in the energy
+   domain is ~1.8 dB/frame: fast enough to track real dynamics, slow enough to
+   remove the post-recovery impulse. Energy (not peak) is used so isolated
+   transients are not over-attenuated, mirroring the SILK PLC glue approach.
+   Stored as a rational so the fixed-point path needs no floating point. */
+#define RECOVERY_ENERGY_GROW_NUM 3
+#define RECOVERY_ENERGY_GROW_DEN 2
+   int          prev_frame_was_loss;
+   int          recovery_ramp_left;
+#ifdef FIXED_POINT
+   opus_int64   recovery_energy;   /* sum of squares of recovered samples */
+#else
+   float        recovery_energy_f;
+#endif
 #ifndef FIXED_POINT
    opus_val16   softclip_mem[2];
 #endif
@@ -266,6 +291,86 @@ static int opus_packet_get_mode(const unsigned char *data)
       mode = MODE_SILK_ONLY;
    }
    return mode;
+}
+
+/* Apply a maximum per-sample gain (Q15 fixed / unit float) to a frame. */
+static void recovery_apply_gain(opus_res *pcm, int frame_size, int channels,
+#ifdef FIXED_POINT
+      opus_int16 gain_q15
+#else
+      float gain
+#endif
+      )
+{
+   int i;
+#ifdef FIXED_POINT
+   for (i = 0; i < frame_size*channels; i++)
+      pcm[i] = MULT16_16_Q15(gain_q15, pcm[i]);
+#else
+   for (i = 0; i < frame_size*channels; i++)
+      pcm[i] = (opus_res)(gain*pcm[i]);
+#endif
+}
+
+/* Limit how fast the signal energy may grow after a recovery. We track the
+   previous frame's energy and cap the current frame's energy to a fixed
+   multiple of it. Attenuating by the square root of the energy ratio keeps
+   the waveform shape while removing the impulse. Only attenuation is applied
+   and the cap relaxes each frame, so real onsets catch up within a few frames.
+   Works in the energy (mean-square) domain, which is robust to isolated peaks
+   and mirrors the SILK PLC energy-matching glue. */
+static void recovery_limit_envelope(OpusDecoder *st, opus_res *pcm, int frame_size)
+{
+   int channels = st->channels;
+   int n = frame_size*channels;
+   int i;
+#ifdef FIXED_POINT
+   opus_int64 energy = 1;
+   opus_int64 cap;
+   opus_int64 ratio_q15;
+   opus_int16 gain;
+   for (i = 0; i < n; i++)
+      energy += (opus_int64)pcm[i]*pcm[i];
+   cap = st->recovery_energy * RECOVERY_ENERGY_GROW_NUM
+         / RECOVERY_ENERGY_GROW_DEN;
+   st->recovery_energy = energy > cap ? cap : energy;
+   if (energy <= cap)
+      return;
+   /* gain = sqrt(cap/energy). Keep the ratio in Q15 using 64-bit math so the
+      large energy values cannot overflow; celt_sqrt() consumes a Q15 value. */
+   ratio_q15 = (cap * Q15ONE) / energy;
+   {
+      /* ratio_q15 is the energy ratio in Q15. The amplitude gain (also Q15)
+         is its square root: gain = sqrt(ratio/32768)*32768
+         = sqrt(ratio*32768). Newton's method in 64-bit avoids celt_sqrt(),
+         which is only accurate near the normalized Q15 input range. */
+      opus_int64 x = ratio_q15 * Q15ONE;
+      opus_int64 r = x;
+      if (r > 0) {
+         int iter;
+         for (iter = 0; iter < 20; iter++)
+            r = (r + x/r) >> 1;
+      }
+      gain = (opus_int16)r;
+   }
+   if (gain >= Q15ONE)
+      return;
+   recovery_apply_gain(pcm, frame_size, channels, gain);
+#else
+   float energy = 1e-12f;
+   float cap, gain;
+   for (i = 0; i < n; i++)
+      energy += (float)pcm[i]*(float)pcm[i];
+   cap = st->recovery_energy_f
+         * ((float)RECOVERY_ENERGY_GROW_NUM/RECOVERY_ENERGY_GROW_DEN);
+   st->recovery_energy_f = energy > cap ? cap : energy;
+   if (energy <= cap)
+      return;
+   gain = sqrtf(cap/energy);
+   if (gain >= 1.0f)
+      return;
+   recovery_apply_gain(pcm, frame_size, channels, gain);
+#endif
 }
 
 static int opus_decode_frame(OpusDecoder *st, const unsigned char *data,
@@ -704,6 +809,50 @@ static int opus_decode_frame(OpusDecoder *st, const unsigned char *data,
          x = MULT16_32_P16(pcm[i],gain);
          pcm[i] = SATURATE(x, 32767);
 #endif
+      }
+   }
+
+   /* FEC/PLC recovery smoothing. A recovery frame is produced for a lost
+      packet (pure PLC with data==NULL, or in-band FEC with decode_fec==1).
+      On each recovery frame we snapshot its energy. The following normal
+      frames then have their energy growth capped, with the cap relaxing each
+      frame, to avoid the post-recovery overshoot that causes the pop. Entirely
+      inert after recovery and when there was no loss, so FEC-off / loss-free
+      output is bit-identical. */
+   {
+      int is_recovery_frame = (data == NULL || decode_fec);
+      if (is_recovery_frame)
+      {
+         int n = frame_size*st->channels;
+         int k;
+         st->prev_frame_was_loss = 1;
+         st->recovery_ramp_left = RECOVERY_RAMP_FRAMES;
+#ifdef FIXED_POINT
+         {
+            opus_int64 energy = 1;
+            for (k = 0; k < n; k++) {
+               energy += (opus_int64)pcm[k]*pcm[k];
+            }
+            st->recovery_energy = energy;
+         }
+#else
+         {
+            float energy = 1e-12f;
+            for (k = 0; k < n; k++) {
+               energy += (float)pcm[k]*(float)pcm[k];
+            }
+            st->recovery_energy_f = energy;
+         }
+#endif
+      } else if (st->prev_frame_was_loss)
+      {
+         if (st->recovery_ramp_left > 0)
+         {
+            recovery_limit_envelope(st, pcm, frame_size);
+            st->recovery_ramp_left--;
+         }
+         if (st->recovery_ramp_left <= 0)
+            st->prev_frame_was_loss = 0;
       }
    }
 
